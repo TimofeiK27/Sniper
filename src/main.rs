@@ -1,5 +1,6 @@
 use solana_client::{
-    rpc_client::RpcClient,
+    //rpc_client::RpcClient,
+    nonblocking::rpc_client::RpcClient,
     pubsub_client::PubsubClient,
     rpc_config::RpcAccountInfoConfig,
     rpc_config::RpcTransactionLogsConfig,
@@ -25,6 +26,11 @@ use solana_sdk::program_pack::Pack;
 use solana_sdk::instruction::Instruction;
 use solana_transaction_status::UiInstruction::Compiled;
 
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::runtime::Handle;
+use std::thread;
+
 use tokio::net::UnixStream;
 use tokio::io::AsyncWriteExt;
 use std::error::Error;
@@ -32,6 +38,9 @@ use std::error::Error;
 use chrono::{TimeZone, Utc};
 
 use std::fmt;
+
+use std::collections::HashSet;
+
 
 #[tokio::main]
 async fn main()-> Result<(), Box<dyn Error>> {
@@ -60,11 +69,15 @@ async fn listen_mint(public_key:&str, endpoint:&str, mut stream:UnixStream) {
 
     println!("Subscribed to program updates. Waiting for events...");
 
-    let rpc_url = "https://api.mainnet-beta.solana.com";
-    let rpc_client = RpcClient::new(rpc_url.to_string());
+    
 
+    let rpc_url = "https://api.mainnet-beta.solana.com";
+    let rpc_client = Arc::new(RpcClient::new(rpc_url.to_string()));
+    let stream = Arc::new(Mutex::new(stream));
+    let seen = Arc::new(Mutex::new(HashSet::new()));
     // Spawn an asynchronous task to continuously process updates.
-    tokio::spawn(async move {
+    tokio::spawn(async move {       
+         
         for response in receiver {
             let log_entry = response.value; // log_entry is RpcLogsResponse
             let logs: Vec<String> = log_entry.logs;
@@ -73,49 +86,57 @@ async fn listen_mint(public_key:&str, endpoint:&str, mut stream:UnixStream) {
             let signature = Signature::from_str(&signature_str)
                 .expect("Failed to parse signature");
             
-            let config = RpcTransactionConfig {
-                encoding: Some(UiTransactionEncoding::Json),
-                commitment: Some(CommitmentConfig::finalized()),
-                max_supported_transaction_version: Some(0),
-            };
-                    // Now you can use &signature where a &Signature is required
-            for line in &logs {
-                if line.contains("SetAuthority") {
-                    match rpc_client.get_transaction_with_config(&signature, config) {
-                        Ok(tx_details) => {
-                            // let latest_block = match rpc_client.get_slot() {
-                            //     Ok(slot) => slot,
-                            //     Err(e) => {
-                            //         eprintln!("Failed to fetch latest block slot: {}", e);
-                            //         return;
-                            //     }
-                            // };
-                            // println!("{:#?} {:#?} ", tx_details.slot,latest_block);
-                            // if tx_details.slot < latest_block {
-                            //     continue;
-                            // }
-                            match check_revoke(tx_details, &rpc_client) {
-                                Ok(account) => {
-                                    println!("mints : {:#?}", account.mint);
-                                    
-                                    let message = account.mint.to_string();
-                                    
-                                    if let Err(e) = stream.write_all(message.as_bytes()).await {
-                                        eprintln!("Message Failed: {}", e);
-                                    } else if let Err(e) = stream.write_all(b"\n").await {
-                                        eprintln!("Message Failed: {}", e);
-                                    } else { // Add a newline as a delimiter.
-                                        println!("Sent message: {}", message);
-                                    };
-                                }
-                                Err(e) => eprintln!("Error processing revoke: {}", e)
-                            } 
-                            
+            let rpc_client = Arc::clone(&rpc_client); 
+            let stream = Arc::clone(&stream); 
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let thread_id = thread::current().id();
+                // println!("Current thread ID: {:?}", thread_id);
+                let config = RpcTransactionConfig {
+                    encoding: Some(UiTransactionEncoding::Json),
+                    commitment: Some(CommitmentConfig::finalized()),
+                    max_supported_transaction_version: Some(0),
+                };
+                        // Now you can use &signature where a &Signature is required
+                for line in &logs {
+                    // println!("{}", logs.len());
+                    if line.contains("SetAuthority") {
+                        
+                        let mut seen = seen.lock().await;
+                        if seen.contains(&signature) {
+                            println!("Skipping duplicate transaction: {}", signature);
+                            continue;
                         }
-                        Err(e) => eprintln!("Error fetching transaction details: {}", e),
-                    }
+                        seen.insert(signature);
+                        match rpc_client.get_transaction_with_config(&signature, config).await {
+                            Ok(tx_details) => {
+                                println!("found2");
+                                match check_revoke(tx_details, &rpc_client).await {
+                                    Ok(account) => {
+                                        println!("mints : {:#?}", account.mint);
+                                        
+                                        let message = account.mint.to_string();
+                                        
+                                        let mut stream = stream.lock().await;
+                                        if let Err(e) = stream.write_all(message.as_bytes()).await {
+                                            eprintln!("Message Failed: {}", e);
+                                        } else if let Err(e) = stream.write_all(b"\n").await {
+                                            eprintln!("Message Failed: {}", e);
+                                        } else { // Add a newline as a delimiter.
+                                            println!("Sent message: {}", message);
+                                        };
+                                    }
+                                    Err(e) => eprintln!("Error processing revoke: {}", e)
+                                } 
+                                
+                            }
+                            Err(e) => eprintln!("Error fetching transaction details: {}", e),
+                        }
+                        println!("HUH");
+                        break;
+                    } 
                 }
-            }
+            });
         }
     });
     // Wait until you send a termination signal (Ctrl+C) to close the connection.
@@ -143,16 +164,17 @@ impl fmt::Display for TransactionError {
 
 impl Error for TransactionError {} 
 
-fn check_revoke (transaction:EncodedConfirmedTransactionWithStatusMeta, rpc_client:&RpcClient) -> Result<Account, TransactionError> {
+async fn check_revoke (transaction:EncodedConfirmedTransactionWithStatusMeta, rpc_client:&RpcClient) -> Result<Account, TransactionError> {
     // println!("{:#?}",transaction);
     //println!("A");
+    
     if let Some(time) = transaction.block_time {
         let datetime = Utc.timestamp_opt(time, 0);
-        println!("{:?}", datetime);
+        println!("{:#?}", datetime);
     }
     
 
-    //println!("time is {:#?}", transaction.block_time);
+    println!("time is {:#?}", transaction.block_time);
     let json_value = match &transaction.transaction.transaction {
         EncodedTransaction::Json(ref json_value) => json_value,
         _ => return Err(TransactionError::NotJsonTransaction),
@@ -222,7 +244,7 @@ fn check_revoke (transaction:EncodedConfirmedTransactionWithStatusMeta, rpc_clie
             let bytes = instruction.data.as_bytes();
             //println!("{:#?}", bytes);
             if bytes[0] - ('0' as u8) == 6 {
-                match get_mint_address(&rpc_client, &all_keys[instruction.accounts[0] as usize]) {
+                match get_mint_address(&rpc_client, &all_keys[instruction.accounts[0] as usize]).await {
                     Ok(acc) => {
                         return Ok(acc)
                     }
@@ -258,11 +280,11 @@ impl std::fmt::Display for AccountFetchError {
 impl std::error::Error for AccountFetchError {}
 
 // Function to get the account data using the RPC client.
-fn get_mint_address(rpc_client: &RpcClient, token_account: &str) -> Result<Account, AccountFetchError> {
+async fn get_mint_address(rpc_client: &RpcClient, token_account: &str) -> Result<Account, AccountFetchError> {
     let token_account_pubkey = Pubkey::from_str(token_account)
         .map_err(|e| AccountFetchError::InvalidPubkey(e.to_string()))?;
 
-    let account_data = rpc_client.get_account_data(&token_account_pubkey)
+    let account_data = rpc_client.get_account_data(&token_account_pubkey).await
         .map_err(|e| AccountFetchError::RpcError(e.to_string()))?;
 
     let token_account_info = Account::unpack(&account_data)
@@ -271,49 +293,3 @@ fn get_mint_address(rpc_client: &RpcClient, token_account: &str) -> Result<Accou
     Ok(token_account_info)
 }
 
-
-
-
-
-
-
-
-async fn listen_user(user_key:&str, endpoint:&str) {
-    let program_id = Pubkey::from_str(user_key) // my solana
-    .expect("Invalid program ID");
-
-    let config = RpcAccountInfoConfig {
-        // Use a finalized commitment to only see fully confirmed updates.
-        commitment: Some(CommitmentConfig::finalized()),
-        // Use Base64 encoding to decode account data.
-        encoding: Some(UiAccountEncoding::Base64),
-        // No data slice is requested.
-        data_slice: None,
-
-        min_context_slot: Some(256),
-    };
-
-    // Subscribe to program updates.
-    let (mut client, receiver) =
-        PubsubClient::account_subscribe(&endpoint, &program_id, Some(config))
-            .expect("Failed to subscribe to program updates");
-
-    println!("Subscribed to program updates. Waiting for events...");
-
-    // Spawn an asynchronous task to continuously process updates.
-    tokio::spawn(async move {
-        for update in receiver {
-            println!("Received update: {:?}", update);
-            // Insert custom logic here to handle updates.
-            
-        }
-    });
-
-    // Wait until you send a termination signal (Ctrl+C) to close the connection.
-    signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
-    println!("Termination signal received. Shutting down...");
-
-    // Shutdown the client gracefully.
-    client.shutdown().expect("Failed to shutdown the client");
-
-}
